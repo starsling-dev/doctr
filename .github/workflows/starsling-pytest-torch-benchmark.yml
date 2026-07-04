@@ -3,108 +3,231 @@ name: StarSling pytest-torch benchmark
 on:
   workflow_dispatch:
 
+env:
+  PYTHON_VERSION: "3.11"
+  SHARD_TOTAL: "8"
+
 jobs:
-  benchmark:
-    name: benchmark / ${{ matrix.variant }}
+  baseline:
+    name: benchmark / baseline
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - variant: baseline
-            workers: ""
-            dist: ""
-          - variant: xdist-2
-            workers: "2"
-            dist: loadscope
-          - variant: xdist-4
-            workers: "4"
-            dist: loadscope
     steps:
       - uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
           architecture: x64
 
       - name: Cache python modules
         uses: actions/cache@v6
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pkg-deps-3.11-${{ hashFiles('pyproject.toml') }}-tests
+          key: ${{ runner.os }}-pkg-deps-${{ env.PYTHON_VERSION }}-${{ hashFiles('pyproject.toml') }}-tests
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -e .[viz,html] --upgrade
           pip install -e .[testing]
-          if [ -n "${{ matrix.workers }}" ]; then
-            pip install pytest-cov pytest-xdist
-          fi
 
-      - name: Run pytest-torch benchmark
+      - name: Run pytest-torch baseline
         shell: bash
         run: |
           set -o pipefail
           started_at="$(date +%s)"
-          if [ -n "${{ matrix.workers }}" ]; then
-            cmd=(
-              pytest
-              tests/pytorch/
-              -rs
-              --durations=20
-              -n "${{ matrix.workers }}"
-              --dist "${{ matrix.dist }}"
-              --cov=doctr
-              --cov-report=xml:coverage-pt.xml
-            )
-          else
-            cmd=(coverage run -m pytest tests/pytorch/ -rs --durations=20)
-          fi
-
-          printf 'variant=%s\n' "${{ matrix.variant }}" | tee benchmark-result.txt
-          printf 'command=%q ' "${cmd[@]}" | tee -a benchmark-result.txt
-          printf '\n' | tee -a benchmark-result.txt
+          printf 'variant=baseline\n' | tee benchmark-result.txt
+          printf 'command=coverage run -m pytest tests/pytorch/ -rs --durations=20\n' | tee -a benchmark-result.txt
 
           set +e
-          "${cmd[@]}" 2>&1 | tee pytest.log
+          coverage run -m pytest tests/pytorch/ -rs --durations=20 2>&1 | tee pytest.log
           status="${PIPESTATUS[0]}"
           set -e
 
           ended_at="$(date +%s)"
-          duration_s="$((ended_at - started_at))"
           printf 'status=%s\n' "$status" | tee -a benchmark-result.txt
-          printf 'duration_s=%s\n' "$duration_s" | tee -a benchmark-result.txt
+          printf 'duration_s=%s\n' "$((ended_at - started_at))" | tee -a benchmark-result.txt
 
-          if [ -z "${{ matrix.workers }}" ]; then
-            coverage xml -o coverage-pt.xml
-          fi
+          coverage xml -o coverage-pt.xml
           test -s coverage-pt.xml
           exit "$status"
 
-      - name: Upload benchmark artifact
+      - name: Upload baseline artifact
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: pytest-torch-benchmark-${{ matrix.variant }}
+          name: pytest-torch-baseline
           path: |
             benchmark-result.txt
             pytest.log
             coverage-pt.xml
           if-no-files-found: warn
 
+  shard:
+    name: benchmark / shard ${{ matrix.shard }} of 8
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: x64
+
+      - name: Cache python modules
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pkg-deps-${{ env.PYTHON_VERSION }}-${{ hashFiles('pyproject.toml') }}-tests
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[viz,html] --upgrade
+          pip install -e .[testing]
+
+      - name: Collect shard tests
+        shell: bash
+        run: |
+          set -o pipefail
+          pytest tests/pytorch/ --collect-only -q > collected-tests.txt
+          python - "${{ matrix.shard }}" "${{ env.SHARD_TOTAL }}" <<'PY'
+          import sys
+
+          shard = int(sys.argv[1])
+          total = int(sys.argv[2])
+          with open("collected-tests.txt", encoding="utf-8") as handle:
+              nodeids = [
+                  line.strip()
+                  for line in handle
+                  if line.startswith("tests/pytorch/") and "::" in line
+              ]
+          selected = [
+              nodeid
+              for index, nodeid in enumerate(nodeids)
+              if index % total == shard - 1
+          ]
+          with open("selected-tests.txt", "w", encoding="utf-8") as handle:
+              handle.write("\n".join(selected))
+              handle.write("\n")
+          print(f"collected={len(nodeids)} selected={len(selected)} shard={shard}/{total}")
+          if not selected:
+              raise SystemExit("empty shard")
+          PY
+
+      - name: Run pytest-torch shard
+        shell: bash
+        run: |
+          set -o pipefail
+          mapfile -t selected_tests < selected-tests.txt
+          started_at="$(date +%s)"
+          printf 'variant=shard-%s-of-%s\n' "${{ matrix.shard }}" "${{ env.SHARD_TOTAL }}" | tee benchmark-result.txt
+          printf 'selected_tests=%s\n' "${#selected_tests[@]}" | tee -a benchmark-result.txt
+          printf 'command=coverage run --parallel-mode -m pytest <selected nodeids> -rs --durations=20\n' | tee -a benchmark-result.txt
+
+          set +e
+          coverage run --parallel-mode -m pytest "${selected_tests[@]}" -rs --durations=20 2>&1 | tee pytest.log
+          status="${PIPESTATUS[0]}"
+          set -e
+
+          ended_at="$(date +%s)"
+          printf 'status=%s\n' "$status" | tee -a benchmark-result.txt
+          printf 'duration_s=%s\n' "$((ended_at - started_at))" | tee -a benchmark-result.txt
+          exit "$status"
+
+      - name: Upload shard artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pytest-torch-shard-${{ matrix.shard }}
+          path: |
+            benchmark-result.txt
+            pytest.log
+            selected-tests.txt
+            collected-tests.txt
+            .coverage*
+          include-hidden-files: true
+          if-no-files-found: warn
+
+  sharded-aggregate:
+    name: benchmark / sharded aggregate
+    runs-on: ubuntu-latest
+    needs: shard
+    if: always()
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: x64
+
+      - name: Install coverage
+        run: python -m pip install "coverage[toml]>=4.5.4"
+
+      - name: Download shard artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: pytest-torch-shard-*
+          path: shard-artifacts
+          merge-multiple: false
+
+      - name: Combine coverage and summarize shards
+        shell: bash
+        run: |
+          set -o pipefail
+          find shard-artifacts -name benchmark-result.txt -print -exec cat {} \; | tee shard-results.txt
+          awk -F= '
+            /variant=/ {variant=$2}
+            /status=/ {status[variant]=$2}
+            /duration_s=/ {duration[variant]=$2; sum+=$2; if ($2 > max) {max=$2; max_variant=variant}}
+            END {
+              printf("max_shard_variant=%s\n", max_variant);
+              printf("max_shard_duration_s=%s\n", max);
+              printf("sum_shard_duration_s=%s\n", sum);
+              for (variant in status) {
+                if (status[variant] != 0) failed=1;
+              }
+              printf("all_shards_green=%s\n", failed ? "false" : "true");
+              exit failed ? 1 : 0;
+            }
+          ' shard-results.txt | tee aggregate-result.txt
+
+          find shard-artifacts -name '.coverage*' -exec cp {} . \;
+          coverage combine
+          coverage xml -o coverage-pt.xml
+          test -s coverage-pt.xml
+
+      - name: Upload aggregate artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pytest-torch-sharded-aggregate
+          path: |
+            aggregate-result.txt
+            shard-results.txt
+            coverage-pt.xml
+          if-no-files-found: warn
+
   summarize:
     name: summarize benchmark
     runs-on: ubuntu-latest
-    needs: benchmark
+    needs: [baseline, sharded-aggregate]
     if: always()
     steps:
       - uses: actions/download-artifact@v8
         with:
-          pattern: pytest-torch-benchmark-*
+          pattern: pytest-torch-*
           path: benchmark-artifacts
           merge-multiple: false
 
@@ -112,3 +235,4 @@ jobs:
         shell: bash
         run: |
           find benchmark-artifacts -name benchmark-result.txt -print -exec cat {} \;
+          find benchmark-artifacts -name aggregate-result.txt -print -exec cat {} \;

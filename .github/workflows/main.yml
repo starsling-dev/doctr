@@ -163,10 +163,21 @@ jobs:
     needs: [ pytest-common, pytest-torch ]
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - name: Download common coverage
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage-common
+          path: coverage-reports
+      - name: Download pytorch coverage
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage-pytorch
+          path: coverage-reports
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7
         with:
+          files: coverage-reports/coverage-common.xml,coverage-reports/coverage-pt.xml
+          disable_search: true
           flags: unittests
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}

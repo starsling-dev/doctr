@@ -145,7 +145,7 @@ jobs:
         if: ${{ needs.pytest-torch-shard.result == 'success' }}
         run: |
           coverage combine shard-coverage
-          coverage xml --ignore-errors -o coverage-pt.xml
+          coverage xml --omit="*/doctr/version.py" -o coverage-pt.xml
 
       - name: Fail if a shard failed
         if: ${{ needs.pytest-torch-shard.result != 'success' }}

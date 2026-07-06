@@ -96,9 +96,15 @@ jobs:
         # .test_durations (e.g. newly added) is assigned the average duration -- still
         # run exactly once, only slightly less balanced -- and a missing durations file
         # degrades to an even split, never to dropped or duplicated tests.
+        #
+        # least_duration (LPT bin-packing) assigns each test to the currently-shortest
+        # group. It is required here because one test (~369s, ~20% of the suite) exceeds
+        # a group's average budget; the default duration_based_chunks algorithm front-
+        # loads the earlier groups and can leave the last group empty (pytest exit 5).
         run: |
           coverage run --parallel-mode -m pytest tests/pytorch/ -rs \
             --splits ${{ matrix.splits }} --group ${{ matrix.group }} \
+            --splitting-algorithm least_duration \
             --durations-path .test_durations
       - uses: actions/upload-artifact@v7
         if: always()

@@ -131,6 +131,7 @@ jobs:
           set +e
           coverage run --parallel-mode -m pytest tests/pytorch/ -rs --durations=20 \
             --splits "${{ env.SPLITS }}" --group "${{ matrix.group }}" \
+            --splitting-algorithm least_duration \
             --durations-path .test_durations 2>&1 | tee pytest.log
           status="${PIPESTATUS[0]}"
           set -e

@@ -2,59 +2,71 @@ name: StarSling pytest-torch benchmark
 
 on:
   workflow_dispatch:
+    inputs:
+      run_baseline:
+        description: "Run the full-suite baseline (also stores .test_durations)"
+        type: boolean
+        default: true
+      run_sharded:
+        description: "Run the 6-way duration-balanced sharded path"
+        type: boolean
+        default: true
 
 env:
   PYTHON_VERSION: "3.11"
-  SHARD_TOTAL: "8"
+  SPLITS: "6"
 
 jobs:
+  # Full-suite baseline. Doubles as the durations generator: --store-durations
+  # writes .test_durations (every test's timing), uploaded so it can be committed
+  # to the candidate + benchmark branches to balance the sharded path.
   baseline:
     name: benchmark / baseline
-    if: ${{ false }}
+    if: ${{ inputs.run_baseline }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           architecture: x64
-
       - name: Cache python modules
         uses: actions/cache@v6
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pkg-deps-${{ env.PYTHON_VERSION }}-${{ hashFiles('pyproject.toml') }}-tests
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -e .[viz,html] --upgrade
           pip install -e .[testing]
-
+          pip install "pytest-split>=0.8.0"
       - name: Run pytest-torch baseline
         shell: bash
         run: |
           set -o pipefail
           started_at="$(date +%s)"
           printf 'variant=baseline\n' | tee benchmark-result.txt
-          printf 'command=coverage run -m pytest tests/pytorch/ -rs --durations=20\n' | tee -a benchmark-result.txt
-
           set +e
-          coverage run -m pytest tests/pytorch/ -rs --durations=20 2>&1 | tee pytest.log
+          coverage run -m pytest tests/pytorch/ -rs --durations=20 \
+            --store-durations --durations-path .test_durations 2>&1 | tee pytest.log
           status="${PIPESTATUS[0]}"
           set -e
-
           ended_at="$(date +%s)"
           printf 'status=%s\n' "$status" | tee -a benchmark-result.txt
           printf 'duration_s=%s\n' "$((ended_at - started_at))" | tee -a benchmark-result.txt
-
           coverage xml -o coverage-pt.xml
-          test -s coverage-pt.xml
+          line_rate="$(grep -o 'line-rate="[0-9.]*"' coverage-pt.xml | head -1)"
+          lines_valid="$(grep -o 'lines-valid="[0-9]*"' coverage-pt.xml | head -1)"
+          lines_covered="$(grep -o 'lines-covered="[0-9]*"' coverage-pt.xml | head -1)"
+          passed="$(grep -oE '[0-9]+ passed' pytest.log | tail -1)"
+          printf 'baseline_%s\n' "$line_rate" | tee -a benchmark-result.txt
+          printf 'baseline_%s\n' "$lines_valid" | tee -a benchmark-result.txt
+          printf 'baseline_%s\n' "$lines_covered" | tee -a benchmark-result.txt
+          printf 'baseline_%s\n' "$passed" | tee -a benchmark-result.txt
           exit "$status"
-
       - name: Upload baseline artifact
         if: always()
         uses: actions/upload-artifact@v7
@@ -64,134 +76,107 @@ jobs:
             benchmark-result.txt
             pytest.log
             coverage-pt.xml
+            .test_durations
+          include-hidden-files: true
           if-no-files-found: warn
 
+  # 6-way duration-balanced shard, using the committed .test_durations. Matches the
+  # candidate main.yml exactly (pytest-split --splits/--group).
   shard:
-    name: benchmark / shard ${{ matrix.shard }} of 8
+    name: benchmark / shard ${{ matrix.group }} of 6
+    if: ${{ inputs.run_sharded }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        group: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@v7
-
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           architecture: x64
-
       - name: Cache python modules
         uses: actions/cache@v6
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pkg-deps-${{ env.PYTHON_VERSION }}-${{ hashFiles('pyproject.toml') }}-tests
-
-      - name: Ensure C++ compiler
+      - name: Ensure C++ compiler for torch.compile
         run: |
-          sudo apt-get update
-          sudo apt-get install -y g++
-          g++ --version
-          cc1plus_path="$(g++ -print-prog-name=cc1plus)"
-          echo "cc1plus=${cc1plus_path}"
-          test -x "${cc1plus_path}"
-
+          if command -v g++ >/dev/null && test -x "$(g++ -print-prog-name=cc1plus)"; then
+            g++ --version
+          else
+            sudo apt-get update
+            sudo apt-get install -y g++
+          fi
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -e .[viz,html] --upgrade
           pip install -e .[testing]
-
-      - name: Collect shard tests
-        shell: bash
-        run: |
-          set -o pipefail
-          pytest tests/pytorch/ --collect-only -q > collected-tests.txt
-          python - "${{ matrix.shard }}" "${{ env.SHARD_TOTAL }}" <<'PY'
-          import sys
-
-          shard = int(sys.argv[1])
-          total = int(sys.argv[2])
-          with open("collected-tests.txt", encoding="utf-8") as handle:
-              nodeids = [
-                  line.strip()
-                  for line in handle
-                  if line.startswith("tests/pytorch/") and "::" in line
-              ]
-          selected = [
-              nodeid
-              for index, nodeid in enumerate(nodeids)
-              if index % total == shard - 1
-          ]
-          with open("selected-tests.txt", "w", encoding="utf-8") as handle:
-              handle.write("\n".join(selected))
-              handle.write("\n")
-          print(f"collected={len(nodeids)} selected={len(selected)} shard={shard}/{total}")
-          if not selected:
-              raise SystemExit("empty shard")
-          PY
-
+          pip install "pytest-split>=0.8.0"
       - name: Run pytest-torch shard
         shell: bash
         run: |
           set -o pipefail
-          mapfile -t selected_tests < selected-tests.txt
           started_at="$(date +%s)"
-          printf 'variant=shard-%s-of-%s\n' "${{ matrix.shard }}" "${{ env.SHARD_TOTAL }}" | tee benchmark-result.txt
-          printf 'selected_tests=%s\n' "${#selected_tests[@]}" | tee -a benchmark-result.txt
-          printf 'command=coverage run --parallel-mode -m pytest <selected nodeids> -rs --durations=20\n' | tee -a benchmark-result.txt
-
+          printf 'variant=shard-%s-of-%s\n' "${{ matrix.group }}" "${{ env.SPLITS }}" | tee benchmark-result.txt
+          if [ -f .test_durations ]; then
+            printf 'durations_file=present\n' | tee -a benchmark-result.txt
+          else
+            printf 'durations_file=MISSING-even-split-fallback\n' | tee -a benchmark-result.txt
+          fi
           set +e
-          coverage run --parallel-mode -m pytest "${selected_tests[@]}" -rs --durations=20 2>&1 | tee pytest.log
+          coverage run --parallel-mode -m pytest tests/pytorch/ -rs --durations=20 \
+            --splits "${{ env.SPLITS }}" --group "${{ matrix.group }}" \
+            --durations-path .test_durations 2>&1 | tee pytest.log
           status="${PIPESTATUS[0]}"
           set -e
-
           ended_at="$(date +%s)"
+          selected="$(grep -oE '[0-9]+ passed' pytest.log | tail -1)"
+          skipped="$(grep -oE '[0-9]+ skipped' pytest.log | tail -1)"
           printf 'status=%s\n' "$status" | tee -a benchmark-result.txt
           printf 'duration_s=%s\n' "$((ended_at - started_at))" | tee -a benchmark-result.txt
+          printf 'shard_%s\n' "$selected" | tee -a benchmark-result.txt
+          printf 'shard_%s\n' "$skipped" | tee -a benchmark-result.txt
           exit "$status"
-
       - name: Upload shard artifact
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: pytest-torch-shard-${{ matrix.shard }}
+          name: pytest-torch-shard-${{ matrix.group }}
           path: |
             benchmark-result.txt
             pytest.log
-            selected-tests.txt
-            collected-tests.txt
             .coverage*
           include-hidden-files: true
           if-no-files-found: warn
 
+  # Mirrors the candidate aggregate: combine shard coverage, omit generated
+  # version.py, and report the combined line-rate for the equivalence proof.
   sharded-aggregate:
     name: benchmark / sharded aggregate
+    if: ${{ inputs.run_sharded }}
     runs-on: ubuntu-latest
     needs: shard
-    if: always()
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           architecture: x64
-
       - name: Install coverage
         run: python -m pip install "coverage[toml]>=4.5.4"
-
       - name: Download shard artifacts
         uses: actions/download-artifact@v8
         with:
           pattern: pytest-torch-shard-*
           path: shard-artifacts
           merge-multiple: false
-
       - name: Combine coverage and summarize shards
         shell: bash
         run: |
@@ -204,20 +189,28 @@ jobs:
             END {
               printf("max_shard_variant=%s\n", max_variant);
               printf("max_shard_duration_s=%s\n", max);
-              printf("sum_shard_duration_s=%s\n", sum);
-              for (variant in status) {
-                if (status[variant] != 0) failed=1;
-              }
+              printf("sum_shard_runner_s=%s\n", sum);
+              for (variant in status) { if (status[variant] != 0) failed=1; }
               printf("all_shards_green=%s\n", failed ? "false" : "true");
-              exit failed ? 1 : 0;
             }
           ' shard-results.txt | tee aggregate-result.txt
-
+          # sum of passed/skipped across shards -> reconciliation vs baseline count
+          sum_passed="$(grep -oE 'shard_[0-9]+ passed' shard-results.txt | grep -oE '[0-9]+' | awk '{s+=$1} END {print s}')"
+          sum_skipped="$(grep -oE 'shard_[0-9]+ skipped' shard-results.txt | grep -oE '[0-9]+' | awk '{s+=$1} END {print s}')"
+          printf 'sum_shard_passed=%s\n' "$sum_passed" | tee -a aggregate-result.txt
+          printf 'sum_shard_skipped=%s\n' "$sum_skipped" | tee -a aggregate-result.txt
           find shard-artifacts -name '.coverage*' -exec cp {} . \;
           coverage combine
-          coverage xml -o coverage-pt.xml
+          coverage xml --omit="*/doctr/version.py" -o coverage-pt.xml
           test -s coverage-pt.xml
-
+          line_rate="$(grep -o 'line-rate="[0-9.]*"' coverage-pt.xml | head -1)"
+          lines_valid="$(grep -o 'lines-valid="[0-9]*"' coverage-pt.xml | head -1)"
+          lines_covered="$(grep -o 'lines-covered="[0-9]*"' coverage-pt.xml | head -1)"
+          printf 'combined_%s\n' "$line_rate" | tee -a aggregate-result.txt
+          printf 'combined_%s\n' "$lines_valid" | tee -a aggregate-result.txt
+          printf 'combined_%s\n' "$lines_covered" | tee -a aggregate-result.txt
+          # fail the aggregate if any shard failed, matching production semantics
+          grep -q 'all_shards_green=true' aggregate-result.txt
       - name: Upload aggregate artifact
         if: always()
         uses: actions/upload-artifact@v7
@@ -228,21 +221,3 @@ jobs:
             shard-results.txt
             coverage-pt.xml
           if-no-files-found: warn
-
-  summarize:
-    name: summarize benchmark
-    runs-on: ubuntu-latest
-    needs: sharded-aggregate
-    if: always()
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: pytest-torch-*
-          path: benchmark-artifacts
-          merge-multiple: false
-
-      - name: Summarize
-        shell: bash
-        run: |
-          find benchmark-artifacts -name benchmark-result.txt -print -exec cat {} \;
-          find benchmark-artifacts -name aggregate-result.txt -print -exec cat {} \;

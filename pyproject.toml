@@ -70,6 +70,7 @@ contrib = [
 ]
 testing = [
     "pytest>=5.3.2",
+    "pytest-split>=0.8.0",
     "coverage[toml]>=4.5.4",
     "onnxruntime>=1.11.0",
     "requests>=2.20.0",
